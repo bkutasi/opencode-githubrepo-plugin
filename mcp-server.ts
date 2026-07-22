@@ -3,7 +3,7 @@
  * Stdio MCP bridge for opencode-githubrepo so non-OpenCode hosts (jcode) can use it.
  * Reuses token/search helpers from index.ts.
  *
- * Tool names: preferred `repotool`, alias `githubrepo` (compat for older prompts).
+ * Tool name: repotool (was githubrepo; use repotool only).
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
@@ -30,8 +30,7 @@ import {
 const DESCRIPTION = `Semantic code search across GitHub repositories using Copilot embeddings.
 Use owner/repo or a full GitHub URL. Optional branch/path/lang filters.`
 
-/** Preferred short name; githubrepo kept as alias for older prompts/sessions. */
-const TOOL_NAMES = ["repotool", "githubrepo"] as const
+const TOOL_NAME = "repotool"
 
 const TOOL_INPUT_SCHEMA = {
   type: "object",
@@ -57,28 +56,31 @@ const TOOL_INPUT_SCHEMA = {
 } as const
 
 const server = new Server(
-  { name: "repotool", version: "1.0.12" },
+  { name: "repotool", version: "1.0.13" },
   { capabilities: { tools: {} } },
 )
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
-      name: "repotool",
-      description: `${DESCRIPTION} Alias: githubrepo.`,
-      inputSchema: TOOL_INPUT_SCHEMA,
-    },
-    {
-      name: "githubrepo",
-      description: `${DESCRIPTION} Preferred name: repotool.`,
+      name: TOOL_NAME,
+      description: DESCRIPTION,
       inputSchema: TOOL_INPUT_SCHEMA,
     },
   ],
 }))
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  if (!TOOL_NAMES.includes(req.params.name as (typeof TOOL_NAMES)[number])) {
-    return { content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }], isError: true }
+  if (req.params.name !== TOOL_NAME) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Unknown tool: ${req.params.name}. Use ${TOOL_NAME} (githubrepo was renamed).`,
+        },
+      ],
+      isError: true,
+    }
   }
   const params = (req.params.arguments ?? {}) as {
     repo?: string
