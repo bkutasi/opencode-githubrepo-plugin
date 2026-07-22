@@ -28,7 +28,8 @@ import {
 } from "./index.ts"
 
 const DESCRIPTION = `Semantic code search across GitHub repositories using Copilot embeddings.
-Use owner/repo or a full GitHub URL. Optional branch/path/lang filters.`
+Use owner/repo or a full GitHub URL. Optional branch/path/lang filters.
+Formerly exposed as the githubrepo tool; prefer repotool.`
 
 const TOOL_NAME = "repotool"
 
