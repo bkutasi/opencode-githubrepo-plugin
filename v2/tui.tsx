@@ -126,6 +126,7 @@ async function showDialog(context) {
 
 function Commands(props) {
   props.context.keymap.layer(() => ({
+    mode: "global",
     commands: [
       {
         id: "githubrepo.settings",
