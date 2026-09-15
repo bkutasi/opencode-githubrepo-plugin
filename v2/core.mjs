@@ -33,9 +33,14 @@ const SYNC_SECRET = process.env.TOKEN_SYNC_SECRET ?? ""
 const SYNC_MODE = !!(SYNC_URL && SYNC_SECRET)
 // Prefer `gh auth token` for search primary (private-repo-heavy use); flips the scope-404
 // retry direction too. Default (unset) keeps Copilot OAuth primary (entitlement-gated public repos).
-const PREFER_GH = (process.env.GITHUBREPO_PREFER_GH ?? "") === "1"
+// Resolved per call (not at module load) so injected-dependency tests are deterministic.
+function preferGh() {
+  return (process.env.GITHUBREPO_PREFER_GH ?? "") === "1"
+}
 /** Embeddings search uses only `gh auth token` — no Copilot OAuth primary or scope-404 retry. */
-const GH_ONLY = (process.env.GITHUBREPO_GH_ONLY ?? "") === "1"
+function ghOnly() {
+  return (process.env.GITHUBREPO_GH_ONLY ?? "") === "1"
+}
 const CONFIG_FILE_NAME = "githubrepo-config.json"
 
 function tokenSyncLivePaths() {
@@ -209,8 +214,36 @@ function hdrs(token) {
   }
 }
 
-async function ghFetch(url, init = {}) {
-  return fetch(url, init)
+/**
+ * HTTP seam. `io.fetch` is only ever supplied by tests (executeSearch deps);
+ * production calls pass no `io` and use global fetch.
+ */
+async function ghFetch(url, init = {}, io) {
+  const fetchFn = io?.fetch ?? fetch
+  return fetchFn(url, init)
+}
+
+// ─── Error sanitization (V2-only) ─────────────────────────────────────────────
+//
+// Upstream GitHub bodies can echo request context back. Every body that reaches
+// a thrown error is normalized: credential-shaped substrings and JSON token /
+// authorization fields are replaced, and the remainder is length-bounded so the
+// status/repository diagnostics stay useful without dumping an unbounded payload.
+
+const REDACTED = "[redacted]"
+const SANITIZED_MAX = 300
+
+export function sanitizeUpstreamBody(text, maxLen = SANITIZED_MAX) {
+  if (text == null) return ""
+  let out = String(text)
+  out = out.replace(/\b(gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,})\b/g, REDACTED)
+  out = out.replace(/\b(Bearer|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, `$1 ${REDACTED}`)
+  out = out.replace(
+    /("?(?:access_token|oauth_token|refresh_token|auth_token|authorization|token)"?\s*[:=]\s*)("?)[^"\s,}]+(\2)/gi,
+    `$1$2${REDACTED}$3`
+  )
+  if (out.length > maxLen) out = `${out.slice(0, maxLen)}…[truncated ${out.length - maxLen} chars]`
+  return out
 }
 
 function readCopilotOauthFromAuthJson(authPath) {
@@ -291,7 +324,7 @@ export async function getToken() {
   }
 
   const tokens = resolveCopilotTokens()
-  if (GH_ONLY) {
+  if (ghOnly()) {
     if (!tokens.gh) {
       throw new Error(
         "GITHUBREPO_GH_ONLY=1 but `gh auth token` failed. Run `gh auth login` (repo scope), start OpenCode via opencode-wrapper so the MCP inherits env."
@@ -300,76 +333,79 @@ export async function getToken() {
     return tokens.gh
   }
   // Copilot OAuth (public entitlement) ↔ `gh auth token` (private repo). PREFER_GH=1 → gh first.
-  return pickPrimaryToken(tokens, PREFER_GH)
+  return pickPrimaryToken(tokens, preferGh())
 }
 
 // ─── Index management ─────────────────────────────────────────────────────────
 
-export async function checkIndex(owner, repo, token, signal) {
+export async function checkIndex(owner, repo, token, signal, io) {
   const response = await ghFetch(`${API}/repos/${owner}/${repo}/copilot_internal/embeddings_index`, {
     method: "GET",
     headers: hdrs(token),
     signal,
-  })
-  if (response.status === 404) return { state: "not-indexed" }
-  if (response.status === 403 && !SYNC_MODE) {
+  }, io)
+  if (!response.ok) {
+    // GitHub often 404s embeddings_index while POST /embeddings/code/search still works (VS Code github_repo tool behavior).
+    if (response.status === 404) {
+      return { state: "ready" }
+    }
     return { state: "error" }
   }
-  if (response.ok) {
-    const data = await response.json()
-    const state = data.clusters && data.clusters.length > 0
-      ? "ready"
-      : data.status === "building" || data.status === "queued"
-        ? "building"
-        : "not-indexed"
-    return { state, sha: data.sha }
-  }
-  return { state: "error" }
+  const data = await response.json()
+  if (data.semantic_code_search_ok && data.semantic_commit_sha) return { state: "ready", sha: data.semantic_commit_sha }
+  if (data.semantic_indexing_enabled) return { state: "building" }
+  return { state: "not-indexed" }
 }
 
-export async function triggerIndex(owner, repo, token, signal) {
+export async function triggerIndex(owner, repo, token, signal, io) {
   const response = await ghFetch(`${API}/repos/${owner}/${repo}/copilot_internal/embeddings_index`, {
     method: "POST",
     headers: hdrs(token),
+    body: JSON.stringify({ auto: false }),
     signal,
-  })
+  }, io)
   return response.ok
 }
 
-export async function waitForIndex(owner, repo, token, signal, attempts) {
+export async function waitForIndex(owner, repo, token, signal, attempts, io) {
+  const check = io?.check ?? checkIndex
+  const nap = io?.sleep ?? sleep
   for (let i = 0; i < attempts; i++) {
-    await sleep(POLL_DELAY, signal)
-    const info = await checkIndex(owner, repo, token, signal)
-    if (info.state === "ready" || info.state === "error") return info
-  }
-  const info = await checkIndex(owner, repo, token, signal)
-  return info.state === "ready" ? info : { state: "building" }
-}
-
-async function waitForReindex(owner, repo, oldSha, token, signal, attempts) {
-  for (let i = 0; i < attempts; i++) {
-    await sleep(POLL_DELAY, signal)
-    const info = await checkIndex(owner, repo, token, signal)
-    if (info.state === "error") return
-    if (info.state === "ready" && info.sha !== oldSha) return
+    await nap(POLL_DELAY, signal)
+    const info = await check(owner, repo, token, signal, io)
+    if (info.state === "ready") return info
+    if (info.state === "error") return info
   }
   return { state: "building" }
 }
 
-export async function getAuthUser(token, signal) {
-  const res = await ghFetch(`${API}/user`, { headers: hdrs(token), signal })
+async function waitForReindex(owner, repo, oldSha, token, signal, attempts, io) {
+  await triggerIndex(owner, repo, token, signal, io)
+  const check = io?.check ?? checkIndex
+  const nap = io?.sleep ?? sleep
+  for (let i = 0; i < attempts; i++) {
+    await nap(POLL_DELAY, signal)
+    const info = await check(owner, repo, token, signal, io)
+    if (info.state === "error") return info
+    if (info.state === "ready" && info.sha && info.sha !== oldSha) return info
+  }
+  return { state: "building" }
+}
+
+export async function getAuthUser(token, signal, io) {
+  const res = await ghFetch(`${API}/user`, { headers: hdrs(token), signal }, io)
   if (!res.ok) return undefined
   const data = await res.json()
   return data.login
 }
 
-async function setDefaultBranch(owner, repo, branch, token, signal) {
+async function setDefaultBranch(owner, repo, branch, token, signal, io) {
   const res = await ghFetch(`${API}/repos/${owner}/${repo}`, {
     method: "PATCH",
     headers: hdrs(token),
     body: JSON.stringify({ default_branch: branch }),
     signal,
-  })
+  }, io)
   return res.ok
 }
 
@@ -378,44 +414,45 @@ function shadowName(repo, branch) {
   return `${SHADOW_PREFIX}-${repo}-${sanitized}`
 }
 
-async function createFork(owner, repo, forkName, token, signal) {
+async function createFork(owner, repo, forkName, token, signal, io) {
   const res = await ghFetch(`${API}/repos/${owner}/${repo}/forks`, {
     method: "POST",
     headers: hdrs(token),
     body: JSON.stringify({ name: forkName, default_branch_only: false }),
     signal,
-  })
+  }, io)
   if (!res.ok) return false
-  const login = (await getAuthUser(token, signal))
+  const login = (await getAuthUser(token, signal, io))
   for (let i = 0; i < 30; i++) {
-    await sleep(2000, signal)
-    const c = await ghFetch(`${API}/repos/${login}/${forkName}`, { headers: hdrs(token), signal })
+    await (io?.sleep ?? sleep)(2000, signal)
+    const c = await ghFetch(`${API}/repos/${login}/${forkName}`, { headers: hdrs(token), signal }, io)
     if (c.ok) return true
   }
   return false
 }
 
-async function deleteShadow(owner, repo, token) {
+async function deleteShadow(owner, repo, token, io) {
   try {
-    await ghFetch(`${API}/repos/${owner}/${repo}`, { method: "DELETE", headers: hdrs(token) })
+    await ghFetch(`${API}/repos/${owner}/${repo}`, { method: "DELETE", headers: hdrs(token) }, io)
   } catch {
     /* best-effort */
   }
 }
 
-export async function ensureShadow(login, owner, repo, branch, token, signal, onStatus) {
+export async function ensureShadow(login, owner, repo, branch, token, signal, onStatus, io) {
+  const nap = io?.sleep ?? sleep
   const sname = shadowName(repo, branch)
-  const exists = await ghFetch(`${API}/repos/${login}/${sname}`, { headers: hdrs(token), signal })
+  const exists = await ghFetch(`${API}/repos/${login}/${sname}`, { headers: hdrs(token), signal }, io)
 
   if (exists.ok) {
     const data = await exists.json()
     if (data.default_branch !== branch) {
       onStatus(`Updating shadow ${sname} default branch to "${branch}"...`)
-      await setDefaultBranch(login, sname, branch, token, signal)
-      const info = await checkIndex(login, sname, token, signal)
+      await setDefaultBranch(login, sname, branch, token, signal, io)
+      const info = await checkIndex(login, sname, token, signal, io)
       if (info.sha) {
         onStatus(`Re-indexing shadow for branch "${branch}"...`)
-        await waitForReindex(login, sname, info.sha, token, signal, Math.ceil(BRANCH_TIMEOUT / POLL_DELAY))
+        await waitForReindex(login, sname, info.sha, token, signal, Math.ceil(BRANCH_TIMEOUT / POLL_DELAY), io)
       }
     }
     return { shadowOwner: login, shadowRepo: sname }
@@ -434,10 +471,10 @@ export async function ensureShadow(login, owner, repo, branch, token, signal, on
         auto_init: false,
       }),
       signal,
-    })
+    }, io)
     if (!createRes.ok) {
       const body = await createRes.text()
-      throw new Error(`Failed to create shadow repo ${sname}: ${body}`)
+      throw new Error(`Failed to create shadow repo ${sname}: ${sanitizeUpstreamBody(body)}`)
     }
 
     onStatus(`Importing ${owner}/${repo}:${branch} into shadow repo...`)
@@ -446,27 +483,27 @@ export async function ensureShadow(login, owner, repo, branch, token, signal, on
       headers: { ...hdrs(token), Accept: "application/vnd.github.barred-rock-preview" },
       body: JSON.stringify({ vcs: "git", vcs_url: `https://github.com/${owner}/${repo}.git` }),
       signal,
-    })
+    }, io)
 
     if (importRes.ok) {
       for (let i = 0; i < 60; i++) {
-        await sleep(3000, signal)
-        const statusRes = await ghFetch(`${API}/repos/${login}/${sname}/import`, { headers: hdrs(token), signal })
+        await nap(3000, signal)
+        const statusRes = await ghFetch(`${API}/repos/${login}/${sname}/import`, { headers: hdrs(token), signal }, io)
         if (!statusRes.ok) break
         const statusData = await statusRes.json()
         if (statusData.status === "complete") break
-        if (statusData.status === "error") throw new Error(`Import failed: ${statusData.status_text}`)
+        if (statusData.status === "error") throw new Error(`Import failed: ${sanitizeUpstreamBody(statusData.status_text)}`)
       }
-      await setDefaultBranch(login, sname, branch, token, signal)
+      await setDefaultBranch(login, sname, branch, token, signal, io)
     } else {
-      await deleteShadow(login, sname, token)
+      await deleteShadow(login, sname, token, io)
       throw new Error(`Cannot create shadow repo for self-owned repo. GitHub import API returned ${importRes.status}.`)
     }
   } else {
     onStatus(`Forking ${owner}/${repo} as ${sname}...`)
-    const created = await createFork(owner, repo, sname, token, signal)
+    const created = await createFork(owner, repo, sname, token, signal, io)
     if (!created) throw new Error(`Failed to create shadow fork ${sname}.`)
-    await setDefaultBranch(login, sname, branch, token, signal)
+    await setDefaultBranch(login, sname, branch, token, signal, io)
   }
 
   return { shadowOwner: login, shadowRepo: sname }
@@ -528,7 +565,7 @@ async function searchOnce(owner, repo, trimmed, token, signal, path, lang, opts)
       embedding_model: opts?.embeddingModel ?? EMBEDDING_MODEL,
     }),
     signal,
-  })
+  }, opts?.io)
 
   if (!response.ok) {
     return { ok: false, status: response.status, text: await response.text() }
@@ -547,11 +584,13 @@ export async function search(owner, repo, query, token, signal, path, lang, opts
 
   let attempt = await searchOnce(owner, repo, trimmed, token, signal, path, lang, opts)
   if (
-    !GH_ONLY &&
+    !ghOnly() &&
     !attempt.ok &&
     isEmbeddingsScopeDenied(attempt.status, attempt.text)
   ) {
-    const fallback = pickScopeFallback(token, resolveCopilotTokens())
+    // Candidate tokens come from injected deps in tests; production reads real creds.
+    const candidates = opts?.tokens ?? resolveCopilotTokens()
+    const fallback = pickScopeFallback(token, candidates)
     if (fallback && fallback !== token) {
       const retry = await searchOnce(owner, repo, trimmed, fallback, signal, path, lang, opts)
       if (retry.ok) return retry.results
@@ -565,10 +604,10 @@ export async function search(owner, repo, query, token, signal, path, lang, opts
       throw new Error(
         `Embeddings search returned 404 "repository not found" for repo:${owner}/${repo} with the current token(s). ` +
           `This is often a token-scope issue (Copilot OAuth vs \`gh auth token\`) or missing Copilot indexing for that repo — not a malformed owner/repo. ` +
-          `Use exact "owner/repo" (case-sensitive owner). Raw: ${text}`
+          `Use exact "owner/repo" (case-sensitive owner). Raw: ${sanitizeUpstreamBody(text)}`
       )
     }
-    throw new Error(`Search failed (${status}): ${text}`)
+    throw new Error(`Search failed (${status}): ${sanitizeUpstreamBody(text)}`)
   }
 
   return attempt.results
@@ -618,13 +657,35 @@ export function format(results, owner, repo, branch) {
 // token → repo parse → optional branch shadow → index check/trigger → search →
 // client-side path filter → dedupe/quality filter → formatted text + title.
 
-export async function executeSearch(input) {
+/**
+ * `deps` is an optional test seam — production calls pass nothing and keep the
+ * real credential/gh/network paths. Recognized keys (all optional):
+ *   token        primary search token (skips credential resolution)
+ *   tokens       candidate token set { copilotOauth, gh } for scope-404 fallback
+ *   getToken     async () => token override
+ *   fetch        fetch implementation (defaults to global fetch)
+ *   sleep        sleep implementation (defaults to real timer)
+ *   checkIndex   index-status probe (defaults to the real checkIndex)
+ *   getAuthUser  auth-login lookup for branch shadowing
+ *   ensureShadow shadow orchestration
+ * Seam values are never logged or echoed.
+ */
+export async function executeSearch(input, deps = {}) {
   // V2 passes JSON-schema inputs through without validation
   // (packages/core/src/tool/runtime.ts decodeInput), so normalize defensively
   // and fail with the same friendly error V1 produces for a bad repo.
   const repoInput = typeof input?.repo === "string" ? input.repo : ""
   const queryInput = typeof input?.query === "string" ? input.query : ""
   const branchInput = typeof input?.branch === "string" ? input.branch : undefined
+
+  const io = {
+    fetch: deps.fetch,
+    sleep: deps.sleep,
+    check: deps.checkIndex,
+  }
+  const check = deps.checkIndex ?? checkIndex
+  const getAuth = deps.getAuthUser ?? ((t, s) => getAuthUser(t, s, io))
+  const ensure = deps.ensureShadow ?? ((...args) => ensureShadow(...args, io))
 
   // Read config from file (updated by /githubrepo TUI command), env vars take precedence
   const cfg = readSearchConfig()
@@ -639,7 +700,7 @@ export async function executeSearch(input) {
   // (V1 combined ctx.abort with the same timeout).
   const signal = AbortSignal.timeout(searchTimeout)
   try {
-    const token = await getToken()
+    const token = deps.token ?? await (deps.getToken ?? getToken)()
     if (!token) {
       throw new Error(
         "Not authenticated for GitHub Copilot embeddings. Run `opencode auth login` and choose github-copilot, and/or `gh auth login` (repo scope for private repos). No custom env or fork wrapper required."
@@ -657,9 +718,9 @@ export async function executeSearch(input) {
     let searchRepo = parsed.repo
 
     if (needsBranch) {
-      const login = await getAuthUser(token, signal)
+      const login = await getAuth(token, signal)
       if (!login) throw new Error("Cannot determine authenticated user for branch search.")
-      const shadow = await ensureShadow(login, parsed.owner, parsed.repo, branch, token, signal, (msg) => {
+      const shadow = await ensure(login, parsed.owner, parsed.repo, branch, token, signal, (msg) => {
         // surface as transient progress when a tool context is available
         progressSinks.forEach((sink) => sink({ title: msg }))
       })
@@ -669,7 +730,7 @@ export async function executeSearch(input) {
 
     let info
     try {
-      info = await checkIndex(searchOwner, searchRepo, token, signal)
+      info = await check(searchOwner, searchRepo, token, signal, io)
     } catch (err) {
       if (isAbortError(err, signal)) return { text: "Search was aborted. Try again with a more specific query.", title: "Search aborted" }
       throw err
@@ -680,7 +741,7 @@ export async function executeSearch(input) {
     }
 
     if (info.state === "not-indexed") {
-      const ok = await triggerIndex(searchOwner, searchRepo, token, signal)
+      const ok = await triggerIndex(searchOwner, searchRepo, token, signal, io)
       if (!ok) throw new Error(`Failed to trigger indexing for ${searchOwner}/${searchRepo}.`)
       if (needsBranch) {
         return {
@@ -688,13 +749,13 @@ export async function executeSearch(input) {
           title: `Indexing ${searchOwner}/${searchRepo} for branch ${branch}`,
         }
       }
-      info = await waitForIndex(searchOwner, searchRepo, token, signal, pollAttempts)
+      info = await waitForIndex(searchOwner, searchRepo, token, signal, pollAttempts, io)
       if (info.state !== "ready") throw new Error("Repository index not ready after polling. Try again shortly.")
     } else if (info.state === "building") {
       if (needsBranch) {
         return { text: `Index still building for ${searchOwner}/${searchRepo}. Try again in a minute.`, title: `Index building` }
       }
-      info = await waitForIndex(searchOwner, searchRepo, token, signal, pollAttempts)
+      info = await waitForIndex(searchOwner, searchRepo, token, signal, pollAttempts, io)
       if (info.state !== "ready") throw new Error("Repository index not ready after polling. Try again shortly.")
     }
 
@@ -707,6 +768,8 @@ export async function executeSearch(input) {
     let results = await search(searchOwner, searchRepo, queryInput, token, signal, apiPath, apiLang, {
       maxResults,
       embeddingModel,
+      io,
+      tokens: deps.tokens,
     })
     results = filterResultsByPathPrefix(results, pathFilters)
     const deduped = dedupeAndFilter(results)
