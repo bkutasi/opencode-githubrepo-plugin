@@ -17,6 +17,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@opencode-ai/plugin": "*",
     "zod": "^4.3.6"
   }

@@ -12,7 +12,7 @@ const MAX_RESULTS = Number(process.env.GITHUBREPO_MAX_RESULTS) || 64
 const EMBEDDING_MODEL = process.env.GITHUBREPO_EMBEDDING_MODEL ?? "metis-1024-I16-Binary"
 const MAX_QUERY_BYTES = Number(process.env.GITHUBREPO_MAX_QUERY_BYTES) || 7800
 const POLL_ATTEMPTS = Number(process.env.GITHUBREPO_POLL_ATTEMPTS) || 10
-const POLL_DELAY = Number(process.env.GITHUBREPO_POLL_DELAY_MS) || 1000
+export const POLL_DELAY = Number(process.env.GITHUBREPO_POLL_DELAY_MS) || 1000
 const API_VERSION = process.env.GITHUBREPO_API_VERSION ?? "2022-11-28"
 const BRANCH_SEARCH = (process.env.GITHUBREPO_BRANCH_SEARCH ?? "true") !== "false"
 const BRANCH_TIMEOUT = Number(process.env.GITHUBREPO_BRANCH_TIMEOUT) || 180000
@@ -75,7 +75,7 @@ function opencodeAuthJsonPaths(): string[] {
   return paths.filter(Boolean)
 }
 
-function readSearchConfig(): Record<string, string> {
+export function readSearchConfig(): Record<string, string> {
   const dir = process.env.OPENCODE_CONFIG_DIR || join(homedir(), ".config", "opencode")
   try { return JSON.parse(readFileSync(join(dir, CONFIG_FILE_NAME), "utf8")) }
   catch { return {} }
@@ -86,7 +86,7 @@ function cfgSecondsToMs(value: string | undefined, fallbackMs: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed * 1000 : fallbackMs
 }
 
-function envMsOrCfgSeconds(envName: string, cfgValue: string | undefined, fallbackMs: number): number {
+export function envMsOrCfgSeconds(envName: string, cfgValue: string | undefined, fallbackMs: number): number {
   const envValue = process.env[envName]
   if (envValue !== undefined) {
     const parsed = Number(envValue)
@@ -95,7 +95,7 @@ function envMsOrCfgSeconds(envName: string, cfgValue: string | undefined, fallba
   return cfgSecondsToMs(cfgValue, fallbackMs)
 }
 
-function isAbortError(err: unknown, signal?: AbortSignal): boolean {
+export function isAbortError(err: unknown, signal?: AbortSignal): boolean {
   return (err as any)?.name === "AbortError" || (err as any)?.name === "TimeoutError" || !!signal?.aborted
 }
 
@@ -166,7 +166,7 @@ function sleep(ms: number, signal?: AbortSignal) {
   })
 }
 
-function parseRepo(input: string): { owner: string; repo: string; branch?: string } | undefined {
+export function parseRepo(input: string): { owner: string; repo: string; branch?: string } | undefined {
   const simple = input.match(/^([^/\s]+)\/([^/\s]+)$/)
   if (simple) return { owner: simple[1], repo: simple[2] }
   try {
@@ -262,7 +262,7 @@ export function pickScopeFallback(primaryToken: string | undefined, tokens: Copi
   return tokens.gh ?? tokens.copilotOauth
 }
 
-async function getToken(): Promise<string | undefined> {
+export async function getToken(): Promise<string | undefined> {
   // Explicit opt-in legacy infra (TOKEN_SYNC_URL + TOKEN_SYNC_SECRET both set):
   // token-sync-live.json then copilot-shared-token.json. Refuses any other fallback.
   if (SYNC_MODE) {
@@ -295,7 +295,7 @@ interface IndexInfo {
   sha?: string
 }
 
-async function checkIndex(owner: string, repo: string, token: string, signal: AbortSignal): Promise<IndexInfo> {
+export async function checkIndex(owner: string, repo: string, token: string, signal: AbortSignal): Promise<IndexInfo> {
   const response = await ghFetch(`${API}/repos/${owner}/${repo}/copilot_internal/embeddings_index`, {
     method: "GET",
     headers: hdrs(token),
@@ -314,7 +314,7 @@ async function checkIndex(owner: string, repo: string, token: string, signal: Ab
   return { state: "not-indexed" }
 }
 
-async function triggerIndex(owner: string, repo: string, token: string, signal: AbortSignal): Promise<boolean> {
+export async function triggerIndex(owner: string, repo: string, token: string, signal: AbortSignal): Promise<boolean> {
   const response = await ghFetch(`${API}/repos/${owner}/${repo}/copilot_internal/embeddings_index`, {
     method: "POST",
     headers: hdrs(token),
@@ -324,7 +324,7 @@ async function triggerIndex(owner: string, repo: string, token: string, signal: 
   return response.ok
 }
 
-async function waitForIndex(owner: string, repo: string, token: string, signal: AbortSignal, attempts: number): Promise<IndexInfo> {
+export async function waitForIndex(owner: string, repo: string, token: string, signal: AbortSignal, attempts: number): Promise<IndexInfo> {
   for (let i = 0; i < attempts; i++) {
     await sleep(POLL_DELAY, signal)
     const info = await checkIndex(owner, repo, token, signal)
@@ -345,7 +345,7 @@ async function waitForReindex(owner: string, repo: string, oldSha: string, token
   return { state: "building" }
 }
 
-async function getAuthUser(token: string, signal: AbortSignal): Promise<string | undefined> {
+export async function getAuthUser(token: string, signal: AbortSignal): Promise<string | undefined> {
   const res = await ghFetch(`${API}/user`, { headers: hdrs(token), signal })
   if (!res.ok) return undefined
   const data = await res.json()
@@ -390,7 +390,7 @@ async function deleteShadow(owner: string, repo: string, token: string) {
   } catch { /* best-effort */ }
 }
 
-async function ensureShadow(
+export async function ensureShadow(
   login: string, owner: string, repo: string, branch: string, token: string, signal: AbortSignal,
   onStatus: (msg: string) => void,
 ): Promise<{ shadowOwner: string; shadowRepo: string }> {
@@ -539,7 +539,7 @@ async function searchOnce(
   return { ok: true, results: data.results ?? [] }
 }
 
-async function search(owner: string, repo: string, query: string, token: string, signal: AbortSignal, path?: string[], lang?: string[], opts?: { maxResults?: number; embeddingModel?: string }): Promise<SearchResult[]> {
+export async function search(owner: string, repo: string, query: string, token: string, signal: AbortSignal, path?: string[], lang?: string[], opts?: { maxResults?: number; embeddingModel?: string }): Promise<SearchResult[]> {
   const encoder = new TextEncoder()
   let trimmed = query
   while (encoder.encode(trimmed).length > MAX_QUERY_BYTES) {
@@ -575,7 +575,7 @@ async function search(owner: string, repo: string, query: string, token: string,
   return attempt.results
 }
 
-function dedupeAndFilter(results: SearchResult[]): SearchResult[] {
+export function dedupeAndFilter(results: SearchResult[]): SearchResult[] {
   if (!results.length) return results
   const sorted = [...results].sort((a, b) => a.distance - b.distance)
   const topScore = 1 - sorted[0].distance
@@ -593,7 +593,7 @@ function dedupeAndFilter(results: SearchResult[]): SearchResult[] {
   return out
 }
 
-function format(results: SearchResult[], owner: string, repo: string, branch?: string): string {
+export function format(results: SearchResult[], owner: string, repo: string, branch?: string): string {
   if (results.length === 0) return "No results found."
   return results
     .map((r, i) => {
