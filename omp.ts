@@ -22,6 +22,7 @@ import {
   isAbortError,
   parseRepo,
   readSearchConfig,
+  resolveCopilotTokens,
   search,
   triggerIndex,
   waitForIndex,
@@ -30,11 +31,23 @@ import {
 const DESCRIPTION = `Semantic code search across GitHub repositories using Copilot embeddings.
 Use owner/repo or a full GitHub URL. Optional branch/path/lang filters.`;
 
+/** Decoded tool p. `Static<TParams>` over the omptype-backed `pi.zod`
+ *  infers `unknown` outside the omp repo, so annotate once here. Runtime
+ *  validation still happens in the omp host before `execute` runs. */
+interface GithubrepoParams {
+  repo: string;
+  query: string;
+  branch?: string;
+  path?: string[];
+  lang?: string[];
+}
+
 export default function githubrepoOmpExtension(pi: ExtensionAPI) {
   const z = pi.zod;
 
   pi.registerTool({
     name: "githubrepo",
+    label: "GitHub Repo Search",
     description: DESCRIPTION,
     parameters: z.object({
       repo: z.string().describe("GitHub repository in 'owner/repo' format or full GitHub URL (supports /tree/branch-name)"),
@@ -48,7 +61,8 @@ export default function githubrepoOmpExtension(pi: ExtensionAPI) {
       path: z.array(z.string()).describe("Filter by file paths, e.g. ['src/', 'README.md']").optional(),
       lang: z.array(z.string()).describe("Filter by language, e.g. ['TypeScript']").optional(),
     }),
-    async execute(_toolCallId, params, _onUpdate, _ctx, signal) {
+    async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+      const p = params as GithubrepoParams;
       // Config mirrors index.ts: file values, env vars take precedence.
       const cfg = readSearchConfig();
       const searchTimeout = envMsOrCfgSeconds("GITHUBREPO_SEARCH_TIMEOUT", cfg.searchTimeout, 120000);
@@ -68,10 +82,10 @@ export default function githubrepoOmpExtension(pi: ExtensionAPI) {
           );
         }
 
-        const parsed = parseRepo(params.repo);
-        if (!parsed) throw new Error(`Invalid repository format: "${params.repo}". Use "owner/repo" or a GitHub URL.`);
+        const parsed = parseRepo(p.repo);
+        if (!parsed) throw new Error(`Invalid repository format: "${p.repo}". Use "owner/repo" or a GitHub URL.`);
 
-        const branch = params.branch ?? parsed.branch;
+        const branch = p.branch ?? parsed.branch;
         const needsBranch = !!branch && branchSearch;
         const pollAttempts = needsBranch ? Math.ceil(branchTimeout / POLL_DELAY) : pollAttemptsCfg;
 
@@ -124,12 +138,12 @@ export default function githubrepoOmpExtension(pi: ExtensionAPI) {
           if (info.state !== "ready") throw new Error("Repository index not ready after polling. Try again shortly.");
         }
 
-        const pathFilters = coerceStringArray(params.path);
-        const langFilters = coerceStringArray(params.lang);
+        const pathFilters = coerceStringArray(p.path);
+        const langFilters = coerceStringArray(p.lang);
         // Repo-only scoping + client prefix filter (path:/lang: in scoping_query 404s on some private repos).
         const apiPath = pathFilters?.length ? undefined : pathFilters;
         const apiLang = pathFilters?.length ? undefined : langFilters;
-        let results = await search(searchOwner, searchRepo, params.query, token, combined, apiPath, apiLang, {
+        let results = await search(searchOwner, searchRepo, p.query, token, combined, apiPath, apiLang, {
           maxResults,
           embeddingModel,
         });
@@ -140,8 +154,8 @@ export default function githubrepoOmpExtension(pi: ExtensionAPI) {
         const suffix = deduped.length === 1 ? " result" : " results";
         const title =
           results.length === deduped.length
-            ? `Searched ${parsed.owner}/${parsed.repo}${branchLabel} for "${params.query}" — ${results.length}${suffix}`
-            : `Searched ${parsed.owner}/${parsed.repo}${branchLabel} for "${params.query}" — ${results.length} raw, ${deduped.length} after quality filter`;
+            ? `Searched ${parsed.owner}/${parsed.repo}${branchLabel} for "${p.query}" — ${results.length}${suffix}`
+            : `Searched ${parsed.owner}/${parsed.repo}${branchLabel} for "${p.query}" — ${results.length} raw, ${deduped.length} after quality filter`;
         pi.logger.info(title);
         return { content: [{ type: "text", text: output }], details: { title, count: deduped.length } };
       } catch (err) {
@@ -153,6 +167,26 @@ export default function githubrepoOmpExtension(pi: ExtensionAPI) {
         }
         throw err;
       }
+    },
+  });
+
+  pi.registerCommand("githubrepo", {
+    description: "Show githubrepo search settings and auth status",
+    handler: async (_args, ctx) => {
+      // Read-only status: values only, never token material.
+      const cfg = readSearchConfig();
+      const tokens = resolveCopilotTokens();
+      const lines = [
+        `Search timeout: ${envMsOrCfgSeconds("GITHUBREPO_SEARCH_TIMEOUT", cfg.searchTimeout, 120000) / 1000}s`,
+        `Branch timeout: ${envMsOrCfgSeconds("GITHUBREPO_BRANCH_TIMEOUT", cfg.branchTimeout, 180000) / 1000}s`,
+        `Max results: ${Number(process.env.GITHUBREPO_MAX_RESULTS || cfg.maxResults) || 64}`,
+        `Embedding model: ${process.env.GITHUBREPO_EMBEDDING_MODEL || cfg.embeddingModel || "metis-1024-I16-Binary"}`,
+        `Poll attempts: ${Number(process.env.GITHUBREPO_POLL_ATTEMPTS || cfg.pollAttempts) || 10}`,
+        `Branch search: ${(process.env.GITHUBREPO_BRANCH_SEARCH ?? "true") !== "false"}`,
+        `Copilot OAuth: ${tokens.copilotOauth ? "yes" : "no"}`,
+        `gh CLI token: ${tokens.gh ? "yes" : "no"}`,
+      ];
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 
