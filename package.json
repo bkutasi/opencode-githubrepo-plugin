@@ -4,8 +4,14 @@
   "description": "OpenCode plugin: semantic code search across GitHub repositories using Copilot embeddings",
   "type": "module",
   "main": "./index.ts",
+  "omp": {
+    "extensions": [
+      "./omp.ts"
+    ]
+  },
   "files": [
     "index.ts",
+    "omp.ts",
     "tui.ts",
     "README.md"
   ],
