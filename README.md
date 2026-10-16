@@ -1,6 +1,6 @@
 # opencode-githubrepo
 
-**v1.0.11** — OpenCode plugin for semantic code search across GitHub repositories using GitHub’s Copilot embeddings API (`api.github.com`). No fork patches, no CAPI proxy, no `opencode-patches` dependency.
+**v1.0.11** — Semantic code search across GitHub repositories using GitHub’s Copilot embeddings API (`api.github.com`). One package, two hosts: OpenCode plugin (`index.ts`) + OMP extension (`omp.ts`). No fork patches, no CAPI proxy, no `opencode-patches` dependency.
 
 ## Quick start (anyone)
 
@@ -81,6 +81,19 @@ And to `tui.json` for the `/githubrepo` TUI command:
   "plugin": ["file:///path/to/opencode-githubrepo/tui.ts"]
 }
 ```
+
+### OMP (oh-my-pi)
+
+Same package, second host (`omp.ts` reuses the `index.ts` pipeline via OMP `ExtensionAPI`; `index.ts`/`tui.ts` untouched, enabled via `omp.extensions` in `package.json`).
+
+```sh
+omp plugin link /path/to/opencode-githubrepo-plugin
+omp plugin list  # must show @lkonga/opencode-githubrepo
+```
+
+- Tool `githubrepo` with the same `repo`/`query`/`branch`/`path`/`lang` params.
+- Command `/githubrepo` shows settings + token presence (never token material). Status view only, no interactive editing yet.
+- Auth is identical: OpenCode `auth.json` Copilot OAuth plus `gh auth token` (`repo` scope for private repos); `GITHUBREPO_PREFER_GH=1` for private-heavy use.
 
 ## Usage
 
