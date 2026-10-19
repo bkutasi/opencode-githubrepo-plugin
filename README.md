@@ -1,6 +1,6 @@
 # opencode-githubrepo
 
-**v1.0.11** — Semantic code search across GitHub repositories using GitHub’s Copilot embeddings API (`api.github.com`). One package, two hosts: OpenCode plugin (`index.ts`) + OMP extension (`omp.ts`). No fork patches, no CAPI proxy, no `opencode-patches` dependency.
+**v1.0.11** — Semantic code search across GitHub repositories using GitHub’s Copilot embeddings API (`api.github.com`). One package, three hosts: OpenCode plugin (`index.ts`) + OMP extension (`omp.ts`) + OMO extension (`omo.ts`). No fork patches, no CAPI proxy, no `opencode-patches` dependency.
 
 ## Quick start (anyone)
 
@@ -89,6 +89,33 @@ Same package, second host (`omp.ts` reuses the `index.ts` pipeline via OMP `Exte
 ```sh
 omp plugin link /path/to/opencode-githubrepo-plugin
 omp plugin list  # must show @lkonga/opencode-githubrepo
+```
+
+- Tool `githubrepo` with the same `repo`/`query`/`branch`/`path`/`lang` params.
+- Command `/githubrepo` shows settings + token presence (never token material). Status view only, no interactive editing yet.
+- Auth is identical: OpenCode `auth.json` Copilot OAuth plus `gh auth token` (`repo` scope for private repos); `GITHUBREPO_PREFER_GH=1` for private-heavy use.
+
+### OMO (omo / senpi)
+
+Same package, third host (`omo.ts` reuses the `index.ts` pipeline via the senpi `ExtensionAPI`; `index.ts`/`tui.ts`/`omp.ts` untouched, enabled via `pi.extensions` in `package.json`).
+
+```sh
+omo install /path/to/opencode-githubrepo-plugin
+omo list  # must show the installed package
+```
+
+- Tool `githubrepo` with the same `repo`/`query`/`branch`/`path`/`lang` params.
+- Command `/githubrepo` shows settings + token presence (never token material). Status view only, no interactive editing yet.
+- Auth is identical: OpenCode `auth.json` Copilot OAuth plus `gh auth token` (`repo` scope for private repos); `GITHUBREPO_PREFER_GH=1` for private-heavy use.
+- Host differences from `omp.ts`: senpi `ToolDefinition.parameters` is a TypeBox schema (not zod), and senpi `ExtensionAPI` has no `pi.zod`/`pi.logger`.
+
+### PI (pi-coding-agent)
+
+Same package, fourth host (`pi.ts` reuses the `index.ts` pipeline via the pi-coding-agent `ExtensionAPI`; `index.ts`/`tui.ts`/`omp.ts`/`omo.ts` untouched, enabled via `pi.extensions` in `package.json`).
+
+```sh
+# Install by linking the repo into ~/.pi/agent/extensions/
+ln -s /path/to/opencode-githubrepo-plugin ~/.pi/agent/extensions/opencode-githubrepo
 ```
 
 - Tool `githubrepo` with the same `repo`/`query`/`branch`/`path`/`lang` params.
