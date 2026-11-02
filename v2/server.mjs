@@ -28,7 +28,7 @@ const INPUT_SCHEMA = {
     branch: {
       type: "string",
       description:
-        "Search a non-default branch. Creates a persistent shadow repo (tmp-ghrtool-{repo}-{branch}) for indexing. Disable with GITHUBREPO_BRANCH_SEARCH=false",
+        "Search a non-default branch using a persistent private managed shadow (tmp-ghrtool-{hash}). Private sources require GITHUBREPO_ALLOW_PRIVATE_SHADOW=true. Disable with GITHUBREPO_BRANCH_SEARCH=false",
     },
     path: {
       type: "array",

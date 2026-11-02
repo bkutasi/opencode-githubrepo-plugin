@@ -4,8 +4,11 @@
 // no `gh`, no timers. Run: bun test v2/semantic-index-v2.test.mjs
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
-const { checkIndex, executeSearch, sanitizeUpstreamBody, waitForIndex } = await import("./core.mjs")
+const { checkIndex, ensureShadow, executeSearch, sanitizeUpstreamBody, waitForIndex } = await import("./core.mjs")
 
 const AMBIENT = { ghOnly: process.env.GITHUBREPO_GH_ONLY, branchSearch: process.env.GITHUBREPO_BRANCH_SEARCH }
 const restore = (key, value) => (value === undefined ? delete process.env[key] : (process.env[key] = value))
@@ -150,12 +153,13 @@ describe("branch shadow routing", () => {
 
   test("explicit non-default branch uses (mocked) shadow orchestration", async () => {
     const shadowCalls = []
-    const fetch = fakeFetch((c) => (c.url.endsWith(INDEX) ? json({ message: "Not Found" }, 404) : hits()))
+    const sha = "a".repeat(40)
+    const fetch = fakeFetch((c) => (c.url.endsWith(INDEX) ? json({ semantic_code_search_ok: true, semantic_commit_sha: sha }) : hits([{ ...RESULT, location: { ...RESULT.location, commit_sha: sha } }])))
     const out = await executeSearch({ repo: "owner/repo", query: "code", branch: "feature/x" }, deps(fetch, {
       getAuthUser: async () => "me",
       ensureShadow: async (login, owner, repo, branch) => {
         shadowCalls.push({ login, owner, repo, branch })
-        return { shadowOwner: login, shadowRepo: `tmp-ghrtool-${repo}-feature-x` }
+        return { shadowOwner: login, shadowRepo: `tmp-ghrtool-${repo}-feature-x`, sourceSha: sha }
       },
     }))
     expect(shadowCalls).toEqual([{ login: "me", owner: "owner", repo: "repo", branch: "feature/x" }])
@@ -163,6 +167,132 @@ describe("branch shadow routing", () => {
     expect(fetch.search().length).toBe(1)
     expect(JSON.parse(fetch.search()[0].body).scoping_query).toBe("repo:me/tmp-ghrtool-repo-feature-x")
     for (const c of fetch.calls) expect(c.method).not.toBe("DELETE")
+  })
+})
+
+describe("managed shadow safety", () => {
+  const sha = "a".repeat(40)
+  test("rejects path traversal before any network request", async () => {
+    const fetch = fakeFetch(() => { throw new Error('unexpected request') })
+    await expect(ensureShadow('me', '..', 'repo', 'feature', OAUTH, SIGNAL, () => {}, { fetch })).rejects.toThrow('Invalid repository')
+    expect(fetch.calls).toHaveLength(0)
+  })
+  test("rejects private sources and collisions without mutations", async () => {
+    for (const mode of ["private", "collision", "forbidden"]) {
+      const fetch = fakeFetch(c => {
+        if (c.url.endsWith('/repos/source/repo')) return json({ id: 7, private: mode === 'private' })
+        if (c.url.includes('/git/ref/')) return json({ object: { sha } })
+        if (mode === 'forbidden') return json({}, 403)
+        return json({ private: false })
+      })
+      await expect(ensureShadow('me', 'source', 'repo', 'feature/a', OAUTH, SIGNAL, () => {}, { fetch })).rejects.toThrow()
+      expect(fetch.calls.every(c => c.method === 'GET')).toBe(true)
+    }
+  })
+  test("reuses only a verified private shadow and distinct identities yield distinct names", async () => {
+    const names = []
+    for (const branch of ['feature/a', 'feature-a']) {
+      const fetch = fakeFetch(c => {
+        if (c.url.endsWith('/repos/source/repo')) return json({ id: 7, private: false })
+        if (c.url.endsWith(INDEX)) return json({ semantic_code_search_ok: true, semantic_commit_sha: sha })
+        if (c.url.includes('/git/ref/')) return json({ object: { sha } })
+        const name = c.url.split('/').pop()
+        names.push(name)
+        return json({ private: true, description: `githubrepo-shadow-v1:${name.slice(-64)}`, owner: { login: 'me' }, fork: false, default_branch: 'githubrepo-shadow' })
+      })
+      const result = await ensureShadow('me', 'source', 'repo', branch, OAUTH, SIGNAL, () => {}, { fetch })
+      expect(result.sourceSha).toBe(sha)
+      expect(fetch.calls.every(c => c.method === 'GET')).toBe(true)
+    }
+    expect(new Set(names).size).toBe(2)
+  })
+  test("synchronizes with gh credentials and cleans up on success, push failure, and identity mismatch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v2-shadow-test-'))
+    const log = join(dir, 'git-log')
+    const ghLog = join(dir, 'gh-log')
+    const keys = ['PATH', 'GH_TOKEN', 'GITHUB_TOKEN', 'GIT_TRACE', 'FAKE_PUSH_FAIL']
+    const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+    const oldSha = 'b'.repeat(40)
+    try {
+      writeFileSync(join(dir, 'gh'), `#!/bin/sh\nprintf '%s|%s\\n' "$GH_TOKEN" "$*" >> '${ghLog}'\nif [ "$1 $2" = 'auth token' ]; then printf 'git-token\\n'; fi\n`)
+      writeFileSync(join(dir, 'git'), `#!/bin/sh\nprintf '%s|%s|%s|%s|%s\\n' "$PWD" "$GH_TOKEN" "$GIT_TRACE" "$GITHUB_TOKEN" "$*" >> '${log}'\ncase "$*" in\n  *rev-parse*) printf '${sha}\\n';;\n  *fetch*|*push*) gh auth git-credential get; case "$*" in *push*) [ "$FAKE_PUSH_FAIL" = 1 ] && exit 1;; esac;;\nesac\nexit 0\n`)
+      chmodSync(join(dir, 'gh'), 0o700)
+      chmodSync(join(dir, 'git'), 0o700)
+      process.env.PATH = `${dir}:${saved.PATH}`
+      process.env.GH_TOKEN = 'ambient-gh'
+      process.env.GITHUB_TOKEN = 'ambient-github'
+      process.env.GIT_TRACE = '1'
+      for (const mode of ['success', 'push-failure', 'identity-mismatch']) {
+        writeFileSync(log, '')
+        writeFileSync(ghLog, '')
+        process.env.FAKE_PUSH_FAIL = mode === 'push-failure' ? '1' : '0'
+        let refs = 0
+        const fetch = fakeFetch(c => {
+          if (c.url.endsWith('/repos/source/repo')) return json({ id: 7, private: false })
+          if (c.url.endsWith('/user')) return json({ login: mode === 'identity-mismatch' ? 'other' : 'me' })
+          if (c.url.endsWith(INDEX)) return json({ semantic_code_search_ok: true, semantic_commit_sha: sha })
+          if (c.url.includes('/repos/source/repo/git/ref/')) return json({ object: { sha } })
+          if (c.url.includes('/git/ref/')) return json({ object: { sha: refs++ === 0 ? oldSha : sha } })
+          const name = c.url.split('/').pop()
+          return json({ private: true, description: `githubrepo-shadow-v1:${name.slice(-64)}`, owner: { login: 'me' }, fork: false, default_branch: 'githubrepo-shadow' })
+        })
+        const run = ensureShadow('me', 'source', 'repo', 'feature/a', OAUTH, SIGNAL, () => {}, { fetch })
+        if (mode === 'success') expect((await run).sourceSha).toBe(sha)
+        else await expect(run).rejects.toThrow(mode === 'push-failure' ? 'Git shadow synchronization failed' : 'identity does not match')
+        expect(fetch.calls.find(c => c.url.endsWith('/user')).auth).toBe('Bearer git-token')
+        expect(fetch.calls.filter(c => !c.url.endsWith('/user')).every(c => c.auth === `Bearer ${OAUTH}`)).toBe(true)
+        const lines = readFileSync(log, 'utf8').trim().split('\n').filter(Boolean)
+        if (mode === 'identity-mismatch') {
+          expect(lines).toHaveLength(0)
+          expect(refs).toBe(1)
+          continue
+        }
+        expect(lines).toHaveLength(4)
+        const records = lines.map(line => line.split('|'))
+        const cwd = records[0][0]
+        expect(existsSync(cwd)).toBe(false)
+        for (const [path, token, trace, githubToken, args] of records) {
+          expect(path).toBe(cwd)
+          expect(token).toBe('git-token')
+          expect(trace).toBe('')
+          expect(githubToken).toBe('')
+          expect(args).toContain('credential.helper=!gh auth git-credential')
+          for (const secret of ['git-token', OAUTH, 'ambient-gh', 'ambient-github']) expect(args).not.toContain(secret)
+        }
+        expect(records[0][4]).toContain('init --bare .')
+        expect(records[1][4]).toContain('fetch --no-tags https://github.com/source/repo.git refs/heads/feature/a:refs/heads/source')
+        expect(records[2][4]).toContain('rev-parse refs/heads/source')
+        expect(records[3][4]).toContain(`push --force-with-lease=refs/heads/githubrepo-shadow:${oldSha}`)
+        expect(records[3][4]).toContain('refs/heads/source:refs/heads/githubrepo-shadow')
+        const ghLines = readFileSync(ghLog, 'utf8').trim().split('\n')
+        expect(ghLines).toEqual(['ambient-gh|auth token', 'git-token|auth git-credential get', 'git-token|auth git-credential get'])
+        expect(refs).toBe(mode === 'success' ? 2 : 1)
+        if (mode === 'push-failure') expect(fetch.calls.some(c => c.url.endsWith(INDEX))).toBe(false)
+      }
+    } finally {
+      for (const key of keys) restore(key, saved[key])
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+  test("requires verified index and result commits and pins source links", async () => {
+    for (const mode of ['missing-index', 'stale-index', 'bad-result', 'ok']) {
+      const fetch = fakeFetch(c => {
+        if (c.url.endsWith(INDEX)) {
+          if (c.method === 'POST') return json({})
+          if (mode === 'missing-index') return json({}, 404)
+          return json({ semantic_code_search_ok: true, semantic_commit_sha: mode === 'stale-index' ? 'b'.repeat(40) : sha })
+        }
+        return hits([{ ...RESULT, location: { ...RESULT.location, commit_sha: mode === 'bad-result' ? 'b'.repeat(40) : sha } }])
+      })
+      const run = executeSearch({ repo: 'owner/repo', query: 'code', branch: 'feature' }, deps(fetch, {
+        getAuthUser: async () => 'me', ensureShadow: async () => ({ shadowOwner: 'me', shadowRepo: 'shadow', sourceSha: sha }),
+      }))
+      if (mode === 'ok') expect((await run).text).toContain(`/blob/${sha}/`)
+      else {
+        await expect(run).rejects.toThrow(mode === 'bad-result' ? 'unverified commit' : 'index')
+        if (mode !== 'bad-result') expect(fetch.search()).toHaveLength(0)
+      }
+    }
   })
 })
 
